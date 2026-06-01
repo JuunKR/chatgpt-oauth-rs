@@ -2,7 +2,8 @@
 //!
 //! Async (tokio + reqwest). The ChatGPT backend rejects `stream: false`, so
 //! all calls are SSE. `send_message` is a convenience wrapper that drives the
-//! stream to completion and returns the final response Value.
+//! stream to completion and returns a typed [`Response`](crate::Response)
+//! (raw `Value` still available via `Response::raw()`).
 
 use std::future::Future;
 use std::sync::OnceLock;
@@ -19,52 +20,39 @@ use crate::auth::{
 };
 use crate::error::ClientError;
 
-/// Cap on the SSE accumulator buffer. Any single SSE event larger than 16MB
-/// is treated as a protocol fault and aborts the stream.
+/// SSE accumulator cap: a single event over 16MB is a protocol fault, abort.
 const MAX_SSE_BUFFER: usize = 16 * 1024 * 1024;
-/// 한 SSE 이벤트가 경계(빈 줄) 없이 가질 수 있는 최대 `data:` 줄 수. 빈 `data:` 줄은
-/// 바이트 캡(`MAX_SSE_BUFFER`)에 거의 안 잡히면서도 `Vec<String>` 엔트리를 계속 쌓으므로,
-/// 줄 수 자체를 따로 캡해 빈 줄 폭주로 인한 메모리 증가를 막는다. 실제 이벤트의 data 는
-/// 보통 1줄(JSON 한 덩어리)이라 65536 은 극도로 넉넉한 상한.
+/// Max `data:` lines per event. Empty `data:` lines barely move the byte cap
+/// but keep growing the Vec; cap line count to stop empty-line floods.
 const MAX_SSE_DATA_LINES: usize = 65_536;
-/// 한 응답에서 누적할 수 있는 출력 텍스트(delta) 총 바이트 상한. 끝나지 않는 스트림이
-/// 메모리를 소진하는 것을 막는다.
+/// Cap on accumulated output text per response, to bound unending streams.
 const MAX_RESPONSE_TEXT_BYTES: usize = 64 * 1024 * 1024;
-/// 한 응답에서 모을 수 있는 output_item 개수 상한.
+/// Cap on output_items per response, to bound unending streams.
 const MAX_RESPONSE_OUTPUT_ITEMS: usize = 100_000;
-/// Maximum idle time between SSE chunks before we abort. Keeps a silent
-/// backend from hanging the caller.
+/// Max idle between SSE chunks before aborting; keeps a silent backend from hanging.
 const SSE_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
-/// `list_models` 등 옵션 없는 호출의 기본 재시도 횟수.
 const DEFAULT_MAX_RETRIES: u32 = 2;
-/// 서버 `Retry-After`(429) 값의 상한. 그대로 신뢰하면 악의적/버그성 429 가
-/// `Retry-After: 999999` 로 태스크를 수 시간~수 일 묶어둘 수 있어, 분 단위로 캡한다.
+/// Cap on server `Retry-After` (429); an unbounded value could pin a task for hours.
 const MAX_RETRY_AFTER: Duration = Duration::from_secs(60);
-/// 공유 client 의 연결(connect) 타임아웃.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// 프로세스 전역에서 재사용하는 `reqwest::Client`.
-///
-/// reqwest 의 Client 는 커넥션 풀과 TLS 세션을 내부에 들고 있어, 호출마다 새로 만들면
-/// 풀이 무력화되고 매 요청 TLS 핸드셰이크를 다시 한다. 한 번 만들어 공유하면 같은 호스트
-/// (chatgpt.com) 로의 반복 호출에서 연결을 재활용한다.
+/// Process-wide shared client: reuses the connection pool and TLS sessions
+/// across repeated calls to the same host (building per-call defeats both).
 pub(crate) fn shared_client() -> &'static reqwest::Client {
     static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
     CLIENT.get_or_init(|| {
         reqwest::Client::builder()
             .connect_timeout(CONNECT_TIMEOUT)
             .build()
-            // 빌더 실패는 TLS 백엔드 초기화 불가 등 환경 문제뿐 — 복구 불가하므로 패닉.
+            // Only fails on unrecoverable env issues (TLS backend init).
             .expect("failed to build shared reqwest client")
     })
 }
-/// 백오프 초기 지연 / 상한.
 const BACKOFF_INITIAL_MS: u64 = 200;
 const BACKOFF_MAX_MS: u64 = 16_000;
 
-/// 지수 백오프 지연 계산 (attempt 1,2,3,... → 200ms, 400ms, 800ms ... 상한 16s).
-/// jitter ±10% 를 더해 thundering herd 를 방지. 외부 rand 의존성 없이 시스템 시간의
-/// 나노초를 엔트로피로 사용 (정밀도보다 분산이 목적).
+/// Exponential backoff (200, 400, 800ms ... capped at 16s) with ±10% jitter to
+/// avoid thundering herd. Uses system-time nanos as entropy (no rand dep).
 fn backoff_delay(attempt: u32) -> Duration {
     let exp = BACKOFF_INITIAL_MS.saturating_mul(2u64.saturating_pow(attempt.saturating_sub(1)));
     let base = exp.min(BACKOFF_MAX_MS);
@@ -77,14 +65,14 @@ fn backoff_delay(attempt: u32) -> Duration {
     Duration::from_millis((base as f64 * mult) as u64)
 }
 
-/// 비동기 작업을 재시도 가능 오류에 대해 백오프하며 반복 실행.
-/// 재시도 불가 오류이거나 횟수를 다 쓰면 마지막 오류를 그대로 반환.
-/// 서버가 `Retry-After`(429)를 주면 그 값을 백오프보다 우선한다.
+/// Retry an async op with backoff. Server `Retry-After` (429) takes priority
+/// over computed backoff.
 ///
-/// `idempotent`: 이 작업을 재시도해도 부작용이 중복되지 않는가.
-/// - `true`  → GET 류(list_models/usage). `is_retryable()` 로 폭넓게 재시도.
-/// - `false` → 부작용 있는 POST(`/responses`). `is_retryable_non_idempotent()` 로
-///   "서버가 받지 못한 게 확실한" 오류(연결 실패/429)만 재시도해 툴 중복 실행·과금을 막는다.
+/// `idempotent`: whether retrying can duplicate side effects.
+/// - `true`  → GETs (list_models/usage): retry broadly via `is_retryable()`.
+/// - `false` → side-effecting POST (`/responses`): only retry errors where the
+///   server provably never received the request (connect failure / 429) via
+///   `is_retryable_non_idempotent()`, to avoid double tool runs and billing.
 async fn with_retry<T, F, Fut>(
     max_retries: u32,
     idempotent: bool,
@@ -153,7 +141,7 @@ pub(crate) fn build_headers(creds: &CodexCredentials, stream: bool) -> Result<He
     Ok(headers)
 }
 
-fn normalize_input(user_message: &str) -> Value {
+pub(crate) fn normalize_input(user_message: &str) -> Value {
     json!([
         {
             "role": "user",
@@ -162,9 +150,7 @@ fn normalize_input(user_message: &str) -> Value {
     ])
 }
 
-/// `Retry-After` 헤더를 초 단위 Duration 으로 파싱 (숫자 형식만 처리).
-/// 서버 값은 `MAX_RETRY_AFTER` 로 상한을 둬, 비정상적으로 큰 값이 태스크를
-/// 무한정 묶어두지 못하게 한다.
+/// Parse numeric `Retry-After` (seconds), capped at `MAX_RETRY_AFTER`.
 fn parse_retry_after(headers: &HeaderMap) -> Option<Duration> {
     headers
         .get(reqwest::header::RETRY_AFTER)
@@ -174,10 +160,8 @@ fn parse_retry_after(headers: &HeaderMap) -> Option<Duration> {
         .map(|d| d.min(MAX_RETRY_AFTER))
 }
 
-/// 비성공 HTTP 응답을 종류별 `ClientError` 로 변환. 본문은 `bounded_text` 로 최대
-/// `MAX_ERROR_BODY`(8KB) 까지 읽어 그대로 보존한다(진단을 위해 자르지 않음. 읽기 단계에서
-/// 이미 8KB 로 바운드되고 UTF-8 안전하게 변환됨).
-/// 429 → RateLimited(+Retry-After), 5xx → Server, 그 외 → Http.
+/// Convert a non-success response to a `ClientError`. Body bounded to
+/// `MAX_ERROR_BODY` (8KB) for diagnostics. 429 → RateLimited, 5xx → Server, else Http.
 async fn http_error(resp: reqwest::Response) -> ClientError {
     let status = resp.status();
     let code = status.as_u16();
@@ -192,32 +176,68 @@ async fn http_error(resp: reqwest::Response) -> ClientError {
     }
 }
 
-/// `GET /models` — list the model slugs the current account can call.
-/// 재시도 가능한 오류(429/5xx/네트워크)는 백오프하며 최대 DEFAULT_MAX_RETRIES 번 더 시도.
-pub async fn list_models() -> Result<Vec<Value>, ClientError> {
-    with_retry(DEFAULT_MAX_RETRIES, true, || async {
+/// One `/models` entry. High-value fields get accessors; the rest via `raw()`
+/// (mirroring the full ~38-field schema would just invite drift).
+#[derive(Debug, Clone)]
+pub struct Model {
+    raw: Value,
+}
+
+impl Model {
+    pub(crate) fn new(raw: Value) -> Model {
+        Model { raw }
+    }
+    /// Model identifier used in requests (`SendOptions.model`).
+    pub fn slug(&self) -> Option<&str> {
+        self.raw.get("slug").and_then(|v| v.as_str())
+    }
+    pub fn display_name(&self) -> Option<&str> {
+        self.raw.get("display_name").and_then(|v| v.as_str())
+    }
+    pub fn description(&self) -> Option<&str> {
+        self.raw.get("description").and_then(|v| v.as_str())
+    }
+    pub fn context_window(&self) -> Option<u64> {
+        self.raw.get("context_window").and_then(|v| v.as_u64())
+    }
+    pub fn max_context_window(&self) -> Option<u64> {
+        self.raw.get("max_context_window").and_then(|v| v.as_u64())
+    }
+    pub fn visibility(&self) -> Option<&str> {
+        self.raw.get("visibility").and_then(|v| v.as_str())
+    }
+    /// Escape hatch for remaining fields.
+    pub fn raw(&self) -> &Value {
+        &self.raw
+    }
+}
+
+/// `GET /models` — models available to the current account. Retryable errors
+/// back off up to DEFAULT_MAX_RETRIES times.
+pub async fn list_models() -> Result<Vec<Model>, ClientError> {
+    let raw = with_retry(DEFAULT_MAX_RETRIES, true, || async {
         let creds = resolve_credentials(false).await?;
         list_models_once(&creds, true).await
     })
-    .await
+    .await?;
+    Ok(raw.into_iter().map(Model::new).collect())
 }
 
-/// 내부 구현: 이미 해석된 creds 로 1회 호출. `refresh_on_401` 이 true 면 401 시
-/// 디스크에서 토큰을 갱신해 1회 재시도한다(공개 디스크 경로). false 면 갱신하지 않고
-/// 에러를 그대로 surface 한다(테스트 주입 경로 — 토큰 수명은 호출자 책임).
+/// One call with already-resolved creds. `refresh_on_401`: when true, refresh
+/// token from disk and retry once (disk path); when false, surface the error
+/// (test-injection path).
 async fn list_models_once(
     creds: &CodexCredentials,
     refresh_on_401: bool,
 ) -> Result<Vec<Value>, ClientError> {
     validate_token_destination(creds)?;
     let url = format!("{}/models?client_version=1.0.0", creds.base_url);
-    // 공유 client 재사용 (커넥션 풀/TLS 세션 재활용). 전체 요청 타임아웃은 per-request 로.
     let resp = shared_client()
         .get(&url)
         .timeout(Duration::from_secs(15))
         .headers(build_headers(creds, false)?)
         .send()
-        .await?; // 네트워크 오류는 ClientError::Network 으로 (재시도 가능 분류)
+        .await?;
     // On 401 (disk path only) refresh from disk and retry once, using the
     // refreshed credentials' base_url so we never re-send a fresh token to an
     // arbitrary caller URL.
@@ -248,38 +268,34 @@ async fn list_models_once(
         .unwrap_or_default())
 }
 
-/// 테스트 전용 주입 seam: 주어진 creds 를 그대로 사용(401 자동 갱신 없음).
+/// Test-only injection seam: uses the given creds as-is (no 401 refresh).
 #[cfg(test)]
 async fn list_models_with_creds(creds: &CodexCredentials) -> Result<Vec<Value>, ClientError> {
     with_retry(DEFAULT_MAX_RETRIES, true, || list_models_once(creds, false)).await
 }
 
-// ──────────────────────────────────────────────────────────────────────
-// 사용량 / rate-limit — `GET /backend-api/wham/usage`
-//
-// 실제 응답을 프로브로 확인해(2026-05) 필드명을 확정했다. 백엔드는 같은 정보를
-// `/responses` 응답의 `x-codex-*` 헤더로도 주지만, 그쪽은 스트리밍 응답을 소비하기
-// 전에 헤더를 캡처해야 해서 API 가 침습적이라, 여기서는 독립된 GET 엔드포인트를 쓴다.
-// ──────────────────────────────────────────────────────────────────────
+// Usage / rate-limit — `GET /backend-api/wham/usage`. Same info is also in
+// `/responses` `x-codex-*` headers, but capturing those before consuming the
+// stream is intrusive, so we use this standalone GET endpoint.
 
-/// rate-limit 윈도우 하나(primary=짧은 창, secondary=긴 창).
+/// One rate-limit window (primary=short, secondary=long).
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct RateWindow {
-    /// 이 창에서 사용한 비율 (0~100).
+    /// Percent used in this window (0-100).
     #[serde(default)]
     pub used_percent: f64,
-    /// 창 길이(초).
+    /// Window length in seconds.
     #[serde(default)]
     pub limit_window_seconds: u64,
-    /// 리셋까지 남은 초.
+    /// Seconds until reset.
     #[serde(default)]
     pub reset_after_seconds: u64,
-    /// 리셋 시각 (epoch seconds).
+    /// Reset time (epoch seconds).
     #[serde(default)]
     pub reset_at: i64,
 }
 
-/// rate-limit 상태.
+/// Rate-limit state.
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct RateLimit {
     #[serde(default)]
@@ -290,18 +306,17 @@ pub struct RateLimit {
     pub secondary_window: Option<RateWindow>,
 }
 
-/// `/wham/usage` 응답에서 필요한 부분(플랜 + rate-limit). 알 수 없는 필드는 무시.
+/// Relevant part of `/wham/usage` (plan + rate-limit). Unknown fields ignored.
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct Usage {
-    /// 플랜 종류(예: "pro", "plus").
+    /// Plan type (e.g. "pro", "plus").
     pub plan_type: Option<String>,
-    /// 메인 rate-limit. 응답에 없으면 None.
+    /// Main rate-limit; None if absent.
     pub rate_limit: Option<RateLimit>,
 }
 
 impl Usage {
-    /// primary/secondary 중 더 많이 쓴 비율(0~100). 정보 없으면 None.
-    /// 선제적 throttle 판단에 쓰기 좋다.
+    /// Higher of primary/secondary used_percent (0-100); None if unknown.
     pub fn max_used_percent(&self) -> Option<f64> {
         let rl = self.rate_limit.as_ref()?;
         let p = rl.primary_window.as_ref().map(|w| w.used_percent);
@@ -315,7 +330,7 @@ impl Usage {
     }
 }
 
-/// codex base_url(`.../backend-api/codex`) → 사용량 URL(`.../backend-api/wham/usage`).
+/// codex base_url (`.../backend-api/codex`) → usage URL (`.../backend-api/wham/usage`).
 pub(crate) fn usage_url_from_base(base_url: &str) -> String {
     base_url
         .strip_suffix("/codex")
@@ -323,8 +338,7 @@ pub(crate) fn usage_url_from_base(base_url: &str) -> String {
         .unwrap_or_else(|| base_url.replace("/backend-api/codex", "/backend-api/wham/usage"))
 }
 
-/// 현재 계정의 사용량/rate-limit 조회. 선제적 quota 모니터링용.
-/// 재시도 가능한 오류는 백오프 재시도, 401 은 갱신 후 1회 재시도.
+/// Fetch current account usage / rate-limit (for proactive quota monitoring).
 pub async fn fetch_usage() -> Result<Usage, ClientError> {
     with_retry(DEFAULT_MAX_RETRIES, true, || async {
         let creds = resolve_credentials(false).await?;
@@ -368,13 +382,17 @@ async fn fetch_usage_once(
         .map_err(ClientError::from)
 }
 
-/// 테스트 전용 주입 seam: 주어진 creds 를 그대로 사용(401 자동 갱신 없음).
+/// Test-only injection seam: uses the given creds as-is (no 401 refresh).
 #[cfg(test)]
 async fn fetch_usage_with_creds(creds: &CodexCredentials) -> Result<Usage, ClientError> {
     with_retry(DEFAULT_MAX_RETRIES, true, || fetch_usage_once(creds, false)).await
 }
 
 #[derive(Debug, Clone)]
+// `#[non_exhaustive]`: control fields keep growing, so external crates build via
+// `SendOptions::new(model)`/`default()` + field edits, not struct literals, making
+// future field additions non-breaking. (Adopting it is itself a one-time break.)
+#[non_exhaustive]
 pub struct SendOptions {
     pub model: String,
     pub instructions: String,
@@ -387,22 +405,34 @@ pub struct SendOptions {
     /// `[{"type":"web_search"},{"type":"image_generation","quality":"high"}]`.
     /// Empty -> no `tools` field is added to the request.
     pub tools: Vec<Value>,
-    /// 재시도 가능한 오류(429/5xx/일시적 네트워크)에 대해 연결을 최대 몇 번 더
-    /// 시도할지. 0이면 재시도 안 함. 기본 2.
+    /// Extra connection attempts for retryable errors (429/5xx/transient
+    /// network). 0 disables retries. Default 2.
     pub max_retries: u32,
-    /// 스트림이 열린 뒤 청크 사이 최대 idle 허용 시간. 이 시간 동안 데이터가 없으면
-    /// 멈춘 백엔드로 보고 스트림을 중단한다. 기본 `SSE_IDLE_TIMEOUT`(120s).
+    /// Max idle time between chunks once the stream is open; exceeding it aborts
+    /// the stream as a stalled backend. Default `SSE_IDLE_TIMEOUT` (120s).
     pub idle_timeout: Duration,
 
-    // ── Responses API 선택 제어 필드. 모두 None 이면 미전송(서버 기본값 사용). ──
-    // 실측(2026-05)으로 이 백엔드가 실제 수용하는 것만 노출한다.
-    // service_tier(flex=400/priority=무시), metadata/client_metadata(400 또는 무효과)는 제외.
-    /// 툴 사용 방식: `"auto"`(기본)/`"none"`/`"required"` 문자열, 또는 특정 툴 지정 객체.
+    // Optional Responses API control fields; None means omit (server default).
+    // Only fields this backend actually accepts are exposed.
+    /// Tool-use mode: `"auto"`/`"none"`/`"required"` string, or a tool-spec object.
     pub tool_choice: Option<Value>,
-    /// 한 턴에 여러 툴을 동시에 호출하도록 허용할지 (기본 true).
+    /// Allow multiple tool calls in one turn (server default true).
     pub parallel_tool_calls: Option<bool>,
-    /// 출력 텍스트 제어 (`{"verbosity": "low|medium|high", "format": {...}}`). 기본 verbosity=medium.
+    /// Output text control (`{"verbosity": "low|medium|high", "format": {...}}`).
     pub text: Option<Value>,
+}
+
+impl SendOptions {
+    /// Start from defaults with only the model set. Recommended entry point
+    /// (`#[non_exhaustive]` blocks struct literals for external crates).
+    ///
+    /// ```ignore
+    /// let mut opts = SendOptions::new("gpt-5.3-codex");
+    /// opts.reasoning_effort = Some("high".into());
+    /// ```
+    pub fn new(model: impl Into<String>) -> Self {
+        SendOptions { model: model.into(), ..Default::default() }
+    }
 }
 
 impl Default for SendOptions {
@@ -448,16 +478,17 @@ pub async fn open_stream(
 /// ]
 /// ```
 ///
-/// 이 호출은 **비멱등**(서버에서 모델 실행·툴 호출·과금 등 부작용을 일으킴)이므로,
-/// 연결 단계 오류 중에서도 "서버가 요청을 받지 못한 게 확실한" 것(연결 수립 실패, 429)만
-/// `opts.max_retries` 범위에서 재시도한다. timeout·요청 중간 끊김·5xx 처럼 서버가 이미
-/// 처리했을 수 있는 오류는 재시도하지 않고 그대로 surface 한다 — 재시도하면 툴이 두 번
-/// 실행되고 과금이 중복될 수 있기 때문. 스트림이 열린 뒤의 오류도 스트림 항목으로만 surface.
+/// This call is **non-idempotent** (model run, tool calls, billing), so only
+/// errors where the server provably never received the request (connect
+/// failure, 429) are retried within `opts.max_retries`. Ambiguous errors
+/// (timeout, mid-request drop, 5xx) are surfaced, not retried, to avoid
+/// double tool runs and double billing. Errors after the stream opens surface
+/// as stream items.
 pub async fn open_stream_with_input(
     input: Value,
     opts: &SendOptions,
 ) -> Result<impl Stream<Item = Result<Value, ClientError>>, ClientError> {
-    // 재시도마다 body 를 다시 보내야 하므로 input 을 매 시도 clone. idempotent=false.
+    // Clone input each attempt since the body is re-sent on retry. idempotent=false.
     with_retry(opts.max_retries, false, || async {
         let creds = resolve_credentials(false).await?;
         open_stream_with_input_once(input.clone(), opts, &creds, true).await
@@ -471,15 +502,15 @@ async fn open_stream_with_input_once(
     creds: &CodexCredentials,
     refresh_on_401: bool,
 ) -> Result<impl Stream<Item = Result<Value, ClientError>> + use<>, ClientError> {
-    // `use<>`: 반환 스트림은 resp.bytes_stream() 을 소유할 뿐 creds/opts 를 빌리지 않는다.
-    // (Rust 2024 RPIT 기본 캡처를 끄지 않으면 호출부의 지역 creds 수명에 묶여 컴파일 실패.)
+    // `use<>`: the returned stream owns resp.bytes_stream() and borrows neither
+    // creds nor opts. Without it, Rust 2024 RPIT default capture would tie the
+    // stream to the caller's local creds lifetime and fail to compile.
     validate_token_destination(creds)?;
 
     let body = build_request_body(input, opts);
 
-    // 공유 client 재사용. 스트리밍 응답이므로 전체 요청 타임아웃은 적용하지 않는다
-    // (긴 응답을 중간에 잘라버림). 연결 타임아웃은 공유 client 에 고정 설정되어 있고,
-    // per-chunk idle 은 SSE_IDLE_TIMEOUT 으로 별도 감시한다.
+    // No overall request timeout on a streaming response (would truncate long
+    // replies); connect timeout is on the shared client, idle is watched per-chunk.
     let url = format!("{}/responses", creds.base_url);
     let resp = shared_client()
         .post(&url)
@@ -510,13 +541,10 @@ async fn open_stream_with_input_once(
         return Err(http_error(resp).await);
     }
 
-    // 스트림을 파싱하기 전에 content-type 을 본다. 백엔드가 200 을 주면서 HTML/JSON
-    // 에러 바디(게이트웨이 페이지, JSON 에러)를 흘리면 여기서 본문과 함께 명확히 잡는다.
-    //
-    // 단, "헤더 없음"은 거부하지 않는다. 실제 ChatGPT 백엔드는 정상 SSE 를 흘리면서도
-    // Content-Type 헤더를 아예 안 주는 경우가 있다(헤더 없음 ≠ 에러). 헤더가 없으면
-    // 통과시키고, 진짜 SSE 가 아니면 아래 sse 파서가 구체적 오류로 잡는다. 명시적으로
-    // text/event-stream 이 아닌 "다른 타입"이 붙은 경우만 에러 바디로 보고 즉시 거부한다.
+    // Check content-type before parsing: a 200 with an HTML/JSON error body
+    // (gateway page, JSON error) is caught here with its body. A *missing*
+    // header is OK — the real backend sometimes streams valid SSE without one;
+    // only an explicitly non-`text/event-stream` type is rejected as an error body.
     let ct_header = resp
         .headers()
         .get(reqwest::header::CONTENT_TYPE)
@@ -534,7 +562,7 @@ async fn open_stream_with_input_once(
     Ok(sse_event_stream(resp.bytes_stream(), opts.idle_timeout))
 }
 
-fn build_request_body(input: Value, opts: &SendOptions) -> Value {
+pub(crate) fn build_request_body(input: Value, opts: &SendOptions) -> Value {
     let mut body_map = serde_json::Map::new();
     body_map.insert("model".into(), json!(opts.model));
     body_map.insert("instructions".into(), json!(opts.instructions));
@@ -543,8 +571,8 @@ fn build_request_body(input: Value, opts: &SendOptions) -> Value {
     body_map.insert("stream".into(), json!(true));
     if let Some(eff) = &opts.reasoning_effort {
         body_map.insert("reasoning".into(), json!({ "effort": eff }));
-        // 추론을 쓸 때만 암호화된 추론 콘텐츠를 응답에 포함하도록 요청한다.
-        // 멀티턴에서 이전 턴의 추론을 (서버 저장 없이) 이어줄 수 있다 — codex-rs 와 동일.
+        // Request encrypted reasoning content only when reasoning is on, so
+        // multi-turn can carry prior reasoning forward without server storage.
         body_map.insert(
             "include".into(),
             json!(["reasoning.encrypted_content"]),
@@ -556,7 +584,7 @@ fn build_request_body(input: Value, opts: &SendOptions) -> Value {
     if !opts.tools.is_empty() {
         body_map.insert("tools".into(), Value::Array(opts.tools.clone()));
     }
-    // 선택 제어 필드 — 설정된 것만 그대로 전달. (실측으로 백엔드가 수용하는 것만)
+    // Optional control fields — forward only those that are set.
     if let Some(tc) = &opts.tool_choice {
         body_map.insert("tool_choice".into(), tc.clone());
     }
@@ -601,7 +629,7 @@ where
         stream: S,
         buf: Vec<u8>,
         data_lines: Vec<String>,
-        data_bytes: usize, // 현재 이벤트의 누적 data 바이트 수 (상한 검사용)
+        data_bytes: usize, // accumulated data bytes for the current event
         eof: bool,
         finished: bool,
         idle_timeout: Duration,
@@ -643,7 +671,7 @@ where
 
                 // Empty line -> event boundary.
                 if line_str.is_empty() {
-                    st.data_bytes = 0; // 이벤트 경계 — 누적 카운터 리셋
+                    st.data_bytes = 0; // event boundary — reset counter
                     if let Some(ev) = take_event(&mut st.data_lines) {
                         match ev {
                             Ok(Some(v)) => return Some((Ok(v), st)),
@@ -667,10 +695,8 @@ where
 
                 if let Some(rest) = line_str.strip_prefix("data:") {
                     let v = rest.strip_prefix(' ').unwrap_or(rest);
-                    // 이벤트 경계 없이 data 만 무한히 쌓이는 것을 막는다(메모리 보호).
-                    // 바이트뿐 아니라 줄 수도 센다: 빈 `data:` 줄은 v.len()==0 이라 바이트
-                    // 캡엔 안 걸리지만 String 엔트리는 계속 늘어 메모리가 샌다. +1 은 join 시
-                    // 들어갈 개행 한 바이트 몫.
+                    // Count lines as well as bytes: empty `data:` lines don't move
+                    // the byte cap but still grow the Vec. +1 is the join newline.
                     st.data_bytes = st.data_bytes.saturating_add(v.len().saturating_add(1));
                     if st.data_bytes > MAX_SSE_BUFFER || st.data_lines.len() >= MAX_SSE_DATA_LINES {
                         st.finished = true;
@@ -742,7 +768,7 @@ where
                 }
                 Ok(Some(Err(e))) => {
                     st.finished = true;
-                    // 청크 수신 중 전송계층 오류 — Network 으로 보존(분류/메시지 유지).
+                    // Transport error mid-stream — preserve as Network.
                     return Some((Err(ClientError::Network(e)), st));
                 }
                 Ok(Some(Ok(chunk))) => {
@@ -779,8 +805,8 @@ fn take_event(data_lines: &mut Vec<String>) -> Option<Result<Option<Value>, Clie
     }
     match serde_json::from_str::<Value>(trimmed) {
         Ok(v) => Some(Ok(Some(v))),
-        // 파싱 실패 시 payload 원문을 메시지에 넣지 않는다 — 에러가 로그로 흘러가면
-        // 프롬프트/출력 조각이 함께 새어나갈 수 있다. 길이만 보고한다.
+        // Withhold the raw payload from the error — it could leak prompt/output
+        // fragments into logs. Report length only.
         Err(e) => Some(Err(ClientError::Protocol(format!(
             "failed to parse SSE data payload as JSON: {e} ({} bytes withheld)",
             trimmed.len()
@@ -788,14 +814,24 @@ fn take_event(data_lines: &mut Vec<String>) -> Option<Result<Option<Value>, Clie
     }
 }
 
-/// Send a single user message and return the final response dict, combining
-/// deltas internally.
-pub async fn send_message(user_message: &str, opts: &SendOptions) -> Result<Value, ClientError> {
-    let stream = open_stream(user_message, opts).await?;
-    drive_stream_to_response(stream).await
+/// Send a single user message and return the typed [`Response`](crate::Response),
+/// combining deltas internally. (Raw Value via `Response::raw()` / `into_raw()`.)
+pub async fn send_message(user_message: &str, opts: &SendOptions) -> Result<crate::Response, ClientError> {
+    send_with_input(normalize_input(user_message), opts).await
 }
 
-/// 테스트 전용 주입 seam: 주어진 creds 를 그대로 사용(401 자동 갱신 없음).
+/// Multi-turn variant of `send_message`: drive a full `input` array to completion
+/// and synthesize a typed [`Response`](crate::Response). For live streaming use
+/// [`open_event_stream_with_input`](crate::open_event_stream_with_input).
+///
+/// This backend is `store:false` — the server keeps no history, so prior turns
+/// must be resent in full as [`InputItem`](crate::InputItem)s each call.
+pub async fn send_with_input(input: Value, opts: &SendOptions) -> Result<crate::Response, ClientError> {
+    let stream = open_stream_with_input(input, opts).await?;
+    Ok(crate::Response::new(drive_stream_to_response(stream).await?))
+}
+
+/// Test-only injection seam: uses the given creds as-is (no 401 refresh).
 #[cfg(test)]
 async fn send_message_with_creds(
     user_message: &str,
@@ -810,15 +846,15 @@ async fn send_message_with_creds(
     drive_stream_to_response(stream).await
 }
 
-/// 열린 SSE 스트림을 끝까지 소비해 최종 response 객체로 합성한다. 델타/아이템을 모으고
-/// 터미널 상태(failed/incomplete 등)를 에러로 surface 한다.
+/// Drive an open SSE stream to completion into a final response object,
+/// collecting deltas/items and surfacing terminal states (failed/incomplete) as errors.
 async fn drive_stream_to_response(
     stream: impl Stream<Item = Result<Value, ClientError>>,
 ) -> Result<Value, ClientError> {
     let mut stream = Box::pin(stream);
     let mut final_response: Option<Value> = None;
     let mut text_deltas: Vec<String> = Vec::new();
-    let mut text_total: usize = 0; // text_deltas 누적 바이트 (상한 검사용)
+    let mut text_total: usize = 0; // accumulated text_deltas bytes
     let mut output_items: Vec<Value> = Vec::new();
 
     while let Some(ev) = stream.next().await {
@@ -839,7 +875,7 @@ async fn drive_stream_to_response(
                     .unwrap_or(Value::Null);
                 return Err(ClientError::Protocol(format!("Codex response failed: {err}")));
             }
-            // 터미널 incomplete 이벤트 — 성공으로 합성되지 않도록 명시적으로 잡는다.
+            // Terminal incomplete event — catch so it isn't synthesized as success.
             "response.incomplete" => {
                 let detail = ev
                     .get("response")
@@ -853,7 +889,7 @@ async fn drive_stream_to_response(
             }
             "response.output_text.delta" => {
                 if let Some(delta) = ev.get("delta").and_then(|d| d.as_str()) {
-                    // 끝나지 않는 스트림이 메모리를 소진하지 않도록 누적 텍스트를 캡한다.
+                    // Cap accumulated text to bound an unending stream.
                     text_total = text_total.saturating_add(delta.len());
                     if text_total > MAX_RESPONSE_TEXT_BYTES {
                         return Err(ClientError::Protocol(format!(
@@ -866,7 +902,7 @@ async fn drive_stream_to_response(
             }
             "response.output_item.done" => {
                 if let Some(item) = ev.get("item").cloned() {
-                    // output_item 개수도 캡 — 무한 스트림 방어.
+                    // Cap output_item count to bound an unending stream.
                     if output_items.len() >= MAX_RESPONSE_OUTPUT_ITEMS {
                         return Err(ClientError::Protocol(format!(
                             "Codex response exceeded max output items ({}) — aborting",
@@ -901,9 +937,9 @@ async fn drive_stream_to_response(
         )));
     }
 
-    // 터미널 상태 검증: `response.completed` 이벤트를 받았더라도 그 response 객체의
-    // status 가 실패/미완을 가리키거나 error 가 박혀 있을 수 있다. 그대로 성공 반환하면
-    // 호출자에게 "완료된 빈/오류 응답"이 조용히 흘러간다(데이터 손실). 여기서 잡는다.
+    // Terminal-status check: even with a `response.completed` event, the response
+    // object's status may be failed/incomplete or carry an error. Returning it as
+    // success would silently hand the caller an empty/error response.
     if let Some(status) = response.get("status").and_then(|s| s.as_str())
         && matches!(status, "failed" | "cancelled" | "incomplete" | "expired")
     {
@@ -917,7 +953,7 @@ async fn drive_stream_to_response(
             "Codex response terminal status `{status}`: {detail}"
         )));
     }
-    // status 가 없어도 error 가 비어있지 않으면 실패로 본다.
+    // Treat a non-null error as failure even without a status.
     if let Some(err) = response.get("error")
         && !err.is_null()
     {
@@ -973,39 +1009,30 @@ pub fn extract_text(response: &Value) -> String {
     out
 }
 
-// ──────────────────────────────────────────────────────────────────────
-// 테스트 — 순수 함수 + SSE 파서. 네트워크 불필요 (가짜 바이트 스트림 주입).
-// ──────────────────────────────────────────────────────────────────────
+// Tests — pure functions + SSE parser. No network (fake byte streams injected).
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    // ── 순수 함수들 ──
-
     #[test]
     fn normalize_input_shape() {
-        let v = normalize_input("안녕");
-        // [{"role":"user","content":[{"type":"input_text","text":"안녕"}]}]
+        let v = normalize_input("hi");
         let first = &v[0];
         assert_eq!(first["role"], "user");
         assert_eq!(first["content"][0]["type"], "input_text");
-        assert_eq!(first["content"][0]["text"], "안녕");
+        assert_eq!(first["content"][0]["text"], "hi");
     }
 
     #[test]
     fn retry_after_is_capped() {
         use reqwest::header::{HeaderValue, RETRY_AFTER};
-        // [P2] 회귀 가드: 비정상적으로 큰 Retry-After 는 상한(MAX_RETRY_AFTER)으로 잘린다.
         let mut huge = HeaderMap::new();
         huge.insert(RETRY_AFTER, HeaderValue::from_static("999999"));
         assert_eq!(parse_retry_after(&huge), Some(MAX_RETRY_AFTER));
-        // 상한 이하의 값은 그대로 통과.
         let mut small = HeaderMap::new();
         small.insert(RETRY_AFTER, HeaderValue::from_static("5"));
         assert_eq!(parse_retry_after(&small), Some(Duration::from_secs(5)));
-        // 헤더가 없으면 None.
         assert_eq!(parse_retry_after(&HeaderMap::new()), None);
-        // 숫자가 아니면(HTTP-date 형식 등) None.
         let mut date = HeaderMap::new();
         date.insert(RETRY_AFTER, HeaderValue::from_static("Wed, 21 Oct 2015 07:28:00 GMT"));
         assert_eq!(parse_retry_after(&date), None);
@@ -1013,7 +1040,6 @@ mod tests {
 
     #[test]
     fn build_request_body_required_fields() {
-        // ..default() 로 새 필드 추가에도 깨지지 않게.
         let opts = SendOptions {
             model: "gpt-5.3-codex".into(),
             instructions: "sys".into(),
@@ -1022,15 +1048,14 @@ mod tests {
         let body = build_request_body(normalize_input("hi"), &opts);
         assert_eq!(body["model"], "gpt-5.3-codex");
         assert_eq!(body["instructions"], "sys");
-        assert_eq!(body["stream"], true);  // ChatGPT 백엔드는 항상 스트림
+        assert_eq!(body["stream"], true);
         assert_eq!(body["store"], false);
         assert!(body.get("input").is_some());
-        // 옵션 미설정이면 선택 필드들은 모두 없어야 함
         for k in [
             "reasoning", "include", "prompt_cache_key", "tools",
             "tool_choice", "parallel_tool_calls", "text",
         ] {
-            assert!(body.get(k).is_none(), "{k} 키가 없어야 함");
+            assert!(body.get(k).is_none(), "{k} should be absent");
         }
     }
 
@@ -1058,7 +1083,6 @@ mod tests {
         };
         let body = build_request_body(normalize_input("hi"), &opts);
         assert_eq!(body["reasoning"]["effort"], "high");
-        // reasoning 을 쓰면 include 에 암호화 추론 콘텐츠 요청이 들어가야 함 (G)
         assert_eq!(body["include"][0], "reasoning.encrypted_content");
         assert_eq!(body["prompt_cache_key"], "k1");
         assert_eq!(body["tools"][0]["type"], "web_search");
@@ -1068,16 +1092,16 @@ mod tests {
     fn extract_text_joins_message_output_text() {
         let resp = json!({
             "output": [
-                { "type": "reasoning", "content": [{"type": "output_text", "text": "무시됨"}] },
+                { "type": "reasoning", "content": [{"type": "output_text", "text": "ignored"}] },
                 { "type": "message", "role": "assistant",
                   "content": [
-                      {"type": "output_text", "text": "안녕"},
-                      {"type": "output_text", "text": "하세요"}
+                      {"type": "output_text", "text": "Hello, "},
+                      {"type": "output_text", "text": "world"}
                   ]
                 }
             ]
         });
-        assert_eq!(extract_text(&resp), "안녕하세요");
+        assert_eq!(extract_text(&resp), "Hello, world");
     }
 
     #[test]
@@ -1085,12 +1109,24 @@ mod tests {
         assert_eq!(extract_text(&json!({})), "");
     }
 
-    // ── SSE 파서 ──
+    #[test]
+    fn model_typed_accessors() {
+        let m = Model::new(json!({
+            "slug":"gpt-5.3-codex","display_name":"GPT-5.3 Codex",
+            "context_window":272000,"max_context_window":400000,"visibility":"public","extra":1
+        }));
+        assert_eq!(m.slug(), Some("gpt-5.3-codex"));
+        assert_eq!(m.display_name(), Some("GPT-5.3 Codex"));
+        assert_eq!(m.context_window(), Some(272000));
+        assert_eq!(m.max_context_window(), Some(400000));
+        assert_eq!(m.visibility(), Some("public"));
+        assert_eq!(m.raw()["extra"], 1);
+        assert_eq!(Model::new(json!({})).slug(), None);
+    }
 
-    /// 가짜 바이트 청크들을 sse_event_stream 에 흘려넣고 이벤트를 모은다.
+    /// Feed fake byte chunks through sse_event_stream and collect the events.
     async fn run_sse(chunks: Vec<bytes::Bytes>) -> Vec<Result<Value, ClientError>> {
         use futures_util::stream;
-        // 아이템 타입을 reqwest::Result<Bytes> 로 맞춤 (Ok 만 생성하므로 Err 구성 불필요).
         let items: Vec<reqwest::Result<bytes::Bytes>> = chunks.into_iter().map(Ok).collect();
         let byte_stream = stream::iter(items);
         let mut s = Box::pin(sse_event_stream(byte_stream, Duration::from_secs(5)));
@@ -1112,18 +1148,16 @@ mod tests {
 
     #[tokio::test]
     async fn sse_done_ends_stream() {
-        // 이벤트 1개 후 [DONE] → [DONE] 이후로는 이벤트가 없어야 함.
         let events = run_sse(vec![bytes::Bytes::from(
             "data: {\"type\":\"a\"}\n\ndata: [DONE]\n\ndata: {\"type\":\"b\"}\n\n",
         )])
         .await;
-        assert_eq!(events.len(), 1); // a 만, b 는 [DONE] 이후라 안 옴
+        assert_eq!(events.len(), 1); // b is after [DONE], so excluded
         assert_eq!(events[0].as_ref().unwrap()["type"], "a");
     }
 
     #[tokio::test]
     async fn sse_multiline_data_joined() {
-        // SSE 스펙: 같은 이벤트의 여러 data: 줄은 \n 으로 join 후 JSON 파싱.
         let events = run_sse(vec![bytes::Bytes::from("data: {\"type\":\ndata: \"x\"}\n\n")]).await;
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].as_ref().unwrap()["type"], "x");
@@ -1131,9 +1165,9 @@ mod tests {
 
     #[tokio::test]
     async fn sse_chunk_split_multibyte_safe() {
-        // "data: {\"k\":\"한\"}\n\n" 을 한글 '한'(3바이트) 중간에서 두 청크로 분리.
+        // Split the 3-byte '한' across two chunks to test multibyte-safe decoding.
         let full = "data: {\"k\":\"한\"}\n\n".as_bytes().to_vec();
-        let mid = 13; // `data: {"k":"` 가 12바이트, 13은 '한' 바이트 중간
+        let mid = 13; // mid-way through the '한' bytes
         let c1 = bytes::Bytes::copy_from_slice(&full[..mid]);
         let c2 = bytes::Bytes::copy_from_slice(&full[mid..]);
         let events = run_sse(vec![c1, c2]).await;
@@ -1143,7 +1177,6 @@ mod tests {
 
     #[tokio::test]
     async fn sse_malformed_json_surfaces_error() {
-        // 잘못된 JSON 은 조용히 버리지 않고 Err 로 나와야 함.
         let events = run_sse(vec![bytes::Bytes::from("data: {not json}\n\n")]).await;
         assert_eq!(events.len(), 1);
         assert!(events[0].is_err());
@@ -1151,8 +1184,7 @@ mod tests {
 
     #[tokio::test]
     async fn sse_empty_data_line_flood_is_capped() {
-        // 이벤트 경계(빈 줄) 없이 빈 `data:` 줄만 쏟아지면 메모리가 새지 않도록 캡에 걸려야 함.
-        // 바이트는 거의 0 이지만 줄 수 캡(MAX_SSE_DATA_LINES)이 막는다.
+        // Empty `data:` lines without an event boundary must hit the line cap.
         let flood = "data:\n".repeat(MAX_SSE_DATA_LINES + 10);
         let events = run_sse(vec![bytes::Bytes::from(flood)]).await;
         let last = events.last().expect("should yield at least the cap error");
@@ -1166,17 +1198,13 @@ mod tests {
 
     #[tokio::test]
     async fn sse_flush_on_eof_without_newline() {
-        // 끝에 빈 줄(\n\n) 없이 EOF 가 와도 마지막 이벤트를 흘려야 함.
         let events = run_sse(vec![bytes::Bytes::from("data: {\"type\":\"last\"}")]).await;
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].as_ref().unwrap()["type"], "last");
     }
 
-    // ── 재시도 / 백오프 (B) ──
-
     #[test]
     fn backoff_exponential_capped() {
-        // jitter ±10% 안에서 200·400·800ms ... 상한 16s.
         let in_range = |d: Duration, base_ms: u64| {
             let ms = d.as_millis() as u64;
             ms >= (base_ms as f64 * 0.9) as u64 && ms <= (base_ms as f64 * 1.1) as u64
@@ -1184,7 +1212,6 @@ mod tests {
         assert!(in_range(backoff_delay(1), 200));
         assert!(in_range(backoff_delay(2), 400));
         assert!(in_range(backoff_delay(3), 800));
-        // 아주 큰 attempt 도 상한(16s)을 넘지 않음 (+10% 여유).
         assert!(backoff_delay(30).as_millis() as u64 <= (BACKOFF_MAX_MS as f64 * 1.1) as u64);
     }
 
@@ -1192,7 +1219,6 @@ mod tests {
     async fn with_retry_retries_then_succeeds() {
         use std::cell::Cell;
         let calls = Cell::new(0u32);
-        // 처음 2번은 429, 3번째 성공.
         let r: Result<u8, ClientError> = with_retry(5, true, || {
             let n = calls.get() + 1;
             calls.set(n);
@@ -1206,7 +1232,7 @@ mod tests {
         })
         .await;
         assert_eq!(r.unwrap(), 42);
-        assert_eq!(calls.get(), 3); // 2번 실패 + 1번 성공
+        assert_eq!(calls.get(), 3); // 2 failures + 1 success
     }
 
     #[tokio::test]
@@ -1219,13 +1245,13 @@ mod tests {
         })
         .await;
         assert!(r.is_err());
-        assert_eq!(calls.get(), 1); // 400 은 재시도 안 함 → 한 번만 호출
+        assert_eq!(calls.get(), 1); // 400 is not retried
     }
 
     #[tokio::test]
     async fn with_retry_non_idempotent_skips_ambiguous_errors() {
         use std::cell::Cell;
-        // 비멱등 모드: 5xx 는 서버가 이미 처리했을 수 있어 재시도하지 않는다(중복 실행 방지).
+        // Non-idempotent: 5xx may have been processed, so don't retry.
         let calls = Cell::new(0u32);
         let r: Result<u8, ClientError> = with_retry(5, false, || {
             calls.set(calls.get() + 1);
@@ -1235,7 +1261,7 @@ mod tests {
         assert!(r.is_err());
         assert_eq!(calls.get(), 1, "5xx must NOT be retried for non-idempotent ops");
 
-        // 비멱등 모드라도 429 는 서버가 처리를 거부한 것이므로 재시도 안전.
+        // 429 is safe to retry even non-idempotent (server refused the request).
         let calls2 = Cell::new(0u32);
         let r2: Result<u8, ClientError> = with_retry(3, false, || {
             let n = calls2.get() + 1;
@@ -1255,7 +1281,6 @@ mod tests {
 
     #[test]
     fn usage_json_parsing() {
-        // 실제 /wham/usage 응답(프로브로 확인)의 핵심 부분을 파싱.
         let raw = r#"{
             "plan_type": "pro",
             "rate_limit": {
@@ -1282,7 +1307,6 @@ mod tests {
         assert!(rl.allowed && !rl.limit_reached);
         assert_eq!(rl.primary_window.as_ref().unwrap().used_percent, 12.5);
         assert_eq!(rl.secondary_window.as_ref().unwrap().reset_at, 1780389606);
-        // primary(12.5)와 secondary(40.0) 중 큰 값.
         assert_eq!(u.max_used_percent(), Some(40.0));
     }
 
@@ -1296,7 +1320,6 @@ mod tests {
 
     #[test]
     fn usage_parses_without_rate_limit() {
-        // rate_limit 필드가 없는 응답도 안전하게 파싱(None).
         let u: Usage = serde_json::from_str(r#"{"plan_type":"plus"}"#).unwrap();
         assert_eq!(u.plan_type.as_deref(), Some("plus"));
         assert!(u.rate_limit.is_none());
@@ -1313,18 +1336,13 @@ mod tests {
         })
         .await;
         assert!(matches!(r, Err(ClientError::Server { status: 503, .. })));
-        assert_eq!(calls.get(), 3); // 최초 1 + 재시도 2 = 3
+        assert_eq!(calls.get(), 3); // 1 initial + 2 retries
     }
 }
 
-// ──────────────────────────────────────────────────────────────────────
-// 통합 테스트 — mock HTTP 서버(wiremock)로 네트워크 경로를 검증한다.
-//
-// `~/.codex/auth.json` 디스크 경로는 공개 API 에 base_url 주입 통로가 없으므로,
-// 여기서는 크레이트 내부 전용(test-only) seam (`*_with_creds`)으로 mock 서버를 가리키는
-// 가짜 creds 를 주입한다. 이 seam 은 `#[cfg(test)]` 라 배포 바이너리엔 존재하지 않고,
-// 외부 사용자에게도 보이지 않는다.
-// ──────────────────────────────────────────────────────────────────────
+// Integration tests — verify network paths against a wiremock HTTP server.
+// The disk path has no public base_url injection seam, so these use the
+// test-only `*_with_creds` seam to point fake creds at the mock server.
 #[cfg(test)]
 mod http_tests {
     use super::*;
@@ -1332,10 +1350,10 @@ mod http_tests {
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
-    /// mock 서버를 가리키는 가짜 자격증명. base_url 은 실제와 같은 `/backend-api/codex` 모양으로
-    /// 만들어 URL 파생(예: /wham/usage)이 올바르게 동작하게 한다.
+    /// Fake creds pointing at the mock server, with a realistic
+    /// `/backend-api/codex` base_url so URL derivation (e.g. /wham/usage) works.
     fn fake_creds(server_uri: &str) -> CodexCredentials {
-        // http://127.0.0.1 을 허용하려면 base-url 신뢰 검사를 끈다. (edition 2024: set_var 는 unsafe)
+        // Disable base-url trust check to allow http://127.0.0.1.
         unsafe {
             std::env::set_var("CODEX_ALLOW_INSECURE_BASE_URL", "1");
         }
@@ -1344,7 +1362,7 @@ mod http_tests {
             refresh_token: "test-refresh".into(),
             base_url: format!("{server_uri}/backend-api/codex"),
             last_refresh: None,
-            from_disk: false, // 테스트 주입 토큰 — insecure 우회 전면 적용 대상
+            from_disk: false, // test-injected token
         }
     }
 
@@ -1369,7 +1387,7 @@ mod http_tests {
     #[tokio::test]
     async fn list_models_429_retry_then_success() {
         let server = MockServer::start().await;
-        // 첫 1회 429(우선순위 높음, 1회 소진) → 이후 200.
+        // First call 429, then 200.
         Mock::given(method("GET"))
             .and(path("/backend-api/codex/models"))
             .respond_with(ResponseTemplate::new(429))
@@ -1385,7 +1403,7 @@ mod http_tests {
 
         let c = fake_creds(&server.uri());
         let models = list_models_with_creds(&c).await.unwrap();
-        assert_eq!(models.len(), 1); // 429 한 번 맞고 재시도해서 성공
+        assert_eq!(models.len(), 1); // succeeds after one 429 + retry
     }
 
     #[tokio::test]
@@ -1411,7 +1429,7 @@ mod http_tests {
     #[tokio::test]
     async fn list_models_400_no_retry() {
         let server = MockServer::start().await;
-        // expect(1): 정확히 1회만 호출되어야 함(재시도 없음). 어기면 drop 시 panic.
+        // expect(1): must be called exactly once (no retry).
         Mock::given(method("GET"))
             .and(path("/backend-api/codex/models"))
             .respond_with(ResponseTemplate::new(400).set_body_string("bad request"))
@@ -1434,8 +1452,8 @@ data: [DONE]\n\n";
         Mock::given(method("POST"))
             .and(path("/backend-api/codex/responses"))
             .respond_with(
-                // set_body_raw(bytes, mime) 로 content-type 을 명시 지정한다. set_body_string 은
-                // content-type 을 text/plain 으로 고정해버려 SSE 검사를 통과 못 한다.
+                // set_body_raw sets content-type explicitly; set_body_string would
+                // force text/plain and fail the SSE content-type check.
                 ResponseTemplate::new(200).set_body_raw(sse.as_bytes(), "text/event-stream"),
             )
             .mount(&server)
@@ -1473,7 +1491,7 @@ data: [DONE]\n\n";
 
     #[tokio::test]
     async fn send_message_wrong_content_type_errors() {
-        // 200 인데 SSE 가 아니라 JSON 에러 바디를 흘리는 경우. content-type 검사로 즉시 잡혀야 함.
+        // 200 but a JSON error body instead of SSE — must be caught by the content-type check.
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/backend-api/codex/responses"))
@@ -1497,9 +1515,8 @@ data: [DONE]\n\n";
 
     #[tokio::test]
     async fn send_message_accepts_missing_content_type() {
-        // 회귀 가드: 실제 ChatGPT 백엔드는 정상 SSE 를 흘리면서 Content-Type 헤더를 아예
-        // 안 주는 경우가 있다. "헤더 없음"을 "SSE 아님"으로 오판해 거부하면 안 된다.
-        // set_body_bytes 는 set_body_raw/string 과 달리 Content-Type 을 붙이지 않는다.
+        // Regression: the real backend may stream valid SSE with no Content-Type
+        // header; missing must not be rejected. set_body_bytes adds no header.
         let server = MockServer::start().await;
         let sse = "data: {\"type\":\"response.output_text.delta\",\"delta\":\"Hello\"}\n\n\
 data: {\"type\":\"response.completed\",\"response\":{\"output\":[{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"Hello\"}]}]}}\n\n\
@@ -1519,7 +1536,7 @@ data: [DONE]\n\n";
 
     #[tokio::test]
     async fn send_message_completed_but_failed_status_errors() {
-        // response.completed 이벤트지만 내부 status=failed + error → 성공으로 새어나가면 안 됨.
+        // response.completed but inner status=failed + error must not leak as success.
         let server = MockServer::start().await;
         let sse = "data: {\"type\":\"response.completed\",\"response\":{\"status\":\"failed\",\"error\":{\"message\":\"model exploded\"},\"output\":[]}}\n\n\
 data: [DONE]\n\n";
@@ -1542,7 +1559,7 @@ data: [DONE]\n\n";
 
     #[tokio::test]
     async fn send_message_response_incomplete_errors() {
-        // 터미널 response.incomplete 이벤트 → 에러로 surface.
+        // Terminal response.incomplete event must surface as an error.
         let server = MockServer::start().await;
         let sse = "data: {\"type\":\"response.incomplete\",\"response\":{\"incomplete_details\":{\"reason\":\"max_output_tokens\"}}}\n\n\
 data: [DONE]\n\n";

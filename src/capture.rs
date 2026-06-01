@@ -1,11 +1,8 @@
-//! 진단용 raw-응답 캡처 (feature = "capture" 에서만 컴파일).
+//! Diagnostic raw-response capture (only compiled under feature = "capture").
 //!
-//! 목적: 이 크레이트가 때리는 각 엔드포인트의 **응답을 "파싱 전 원본"으로** 떠서,
-//! OpenAI 가 응답 모양을 바꿨을 때 디버그 코드를 새로 짜지 않고 **눈으로** 확인하게 한다.
-//! 일반 함수(`fetch_usage` 등)는 응답을 곧장 타입으로 파싱하므로, 모양이 바뀌면 파싱
-//! 단계에서 에러가 나 정작 원본 바디를 못 본다. 여기 함수들은 그 파싱을 건너뛴다.
-//!
-//! URL/헤더/클라이언트는 실제 코드가 쓰는 내부 헬퍼를 그대로 재사용한다(드리프트 방지).
+//! Captures endpoint responses pre-parse so schema changes can be inspected by
+//! eye, unlike the normal typed functions that error at the parse step. Reuses
+//! the real internal URL/header/client helpers to avoid drift.
 
 use std::time::Duration;
 
@@ -15,15 +12,25 @@ use serde_json::Value;
 use crate::auth::{self, resolve_credentials};
 use crate::client;
 
-/// 파싱 전 HTTP 응답 스냅샷. `body` 는 원본 문자열, `body_json` 은 JSON 으로 읽히면 그 값.
+/// Pre-parse HTTP response snapshot.
 #[derive(Debug, serde::Serialize)]
 pub struct RawCapture {
     pub method: String,
     pub endpoint: String,
     pub status: u16,
     pub body: String,
-    /// best-effort 파싱(JSON 이 아니면 None). 보기 좋게 출력하려는 용도.
+    /// Best-effort parse (None if not JSON).
     pub body_json: Option<Value>,
+}
+
+/// Today's UTC date "YYYY-MM-DD", for capture file/dir names.
+pub fn today_utc() -> String {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let (y, m, d, _, _, _) = crate::auth::epoch_to_ymdhms(secs);
+    format!("{y:04}-{m:02}-{d:02}")
 }
 
 async fn snapshot(method: &str, url: &str, resp: reqwest::Response) -> Result<RawCapture> {
@@ -39,10 +46,12 @@ async fn snapshot(method: &str, url: &str, resp: reqwest::Response) -> Result<Ra
     })
 }
 
-/// `GET /wham/usage` — 사용량/rate-limit 응답을 **파싱 없이** 원본으로.
-/// 멱등(GET)이라 반복 캡처해도 안전. 토큰 필요(없으면 ReloginRequired).
+/// `GET /wham/usage` raw, unparsed. Idempotent, safe to repeat; needs a token.
 pub async fn usage_raw() -> Result<RawCapture> {
     let creds = resolve_credentials(false).await?;
+    // Validate token destination before attaching Authorization (prevents token
+    // leak to a malicious base_url under CODEX_ALLOW_INSECURE_BASE_URL).
+    auth::validate_token_destination(&creds)?;
     let url = client::usage_url_from_base(&creds.base_url);
     let resp = client::shared_client()
         .get(&url)
@@ -54,9 +63,24 @@ pub async fn usage_raw() -> Result<RawCapture> {
     snapshot("GET", &url, resp).await
 }
 
-/// device-code 발급 POST(`/deviceauth/usercode`) 응답을 원본으로.
-/// **안전**: 로그인을 *시작*만 하고 폴링/완료를 하지 않으므로 부작용이 없다(코드만 발급되고
-/// 버려짐). 인증 토큰도 필요 없다(로그인 전 단계).
+/// `GET /models` raw, unparsed. Idempotent, safe.
+pub async fn models_raw() -> Result<RawCapture> {
+    let creds = resolve_credentials(false).await?;
+    // Validate token destination before attaching Authorization (see usage_raw).
+    auth::validate_token_destination(&creds)?;
+    let url = format!("{}/models?client_version=1.0.0", creds.base_url);
+    let resp = client::shared_client()
+        .get(&url)
+        .timeout(Duration::from_secs(15))
+        .headers(client::build_headers(&creds, false)?)
+        .send()
+        .await
+        .context("models request failed")?;
+    snapshot("GET", &url, resp).await
+}
+
+/// device-code POST (`/deviceauth/usercode`) raw. Safe: only starts login (no
+/// poll/complete), so no side effects; needs no token.
 pub async fn device_usercode_raw() -> Result<RawCapture> {
     let url = auth::DEVICE_USERCODE_URL;
     let client = reqwest::Client::builder()
@@ -72,11 +96,19 @@ pub async fn device_usercode_raw() -> Result<RawCapture> {
     snapshot("POST", url, resp).await
 }
 
-/// `POST /responses` — SSE 이벤트를 **집계 없이 원본 Value 배열**로 수집.
-/// (open_stream 이 이미 원본 이벤트를 주므로 그걸 모은다. 토큰/쿼터 소모하지만 안전.)
+/// `POST /responses` — collect SSE events as a raw, unaggregated Value array.
+/// Consumes tokens/quota but is otherwise safe.
 pub async fn responses_raw(prompt: &str, opts: &crate::SendOptions) -> Result<Vec<Value>> {
+    responses_with_input_raw(crate::client::normalize_input(prompt), opts).await
+}
+
+/// `POST /responses` with a full input array (multiturn / tool feedback capture).
+pub async fn responses_with_input_raw(
+    input: Value,
+    opts: &crate::SendOptions,
+) -> Result<Vec<Value>> {
     use futures_util::StreamExt;
-    let stream = client::open_stream(prompt, opts)
+    let stream = client::open_stream_with_input(input, opts)
         .await
         .context("failed to open /responses stream")?;
     let mut stream = Box::pin(stream);
@@ -85,4 +117,33 @@ pub async fn responses_raw(prompt: &str, opts: &crate::SendOptions) -> Result<Ve
         events.push(ev.context("stream event error")?);
     }
     Ok(events)
+}
+
+/// Probe whether the backend accepts given built-in tools: sends a minimal
+/// `/responses` request and records 200 (accepted, SSE body not read) vs non-200
+/// (error body kept up to 8KB). Used to discover the built-in tool catalog.
+pub async fn responses_probe_raw(tools: Vec<Value>, prompt: &str) -> Result<RawCapture> {
+    let creds = resolve_credentials(false).await?;
+    // Validate token destination before attaching Authorization (see usage_raw).
+    auth::validate_token_destination(&creds)?;
+    let opts = crate::SendOptions { tools, ..Default::default() };
+    let body = client::build_request_body(client::normalize_input(prompt), &opts);
+    let url = format!("{}/responses", creds.base_url);
+    let resp = client::shared_client()
+        .post(&url)
+        .timeout(Duration::from_secs(30))
+        .headers(client::build_headers(&creds, true)?)
+        .json(&body)
+        .send()
+        .await
+        .context("responses probe request failed")?;
+    let status = resp.status().as_u16();
+    let (body, body_json) = if status == 200 {
+        ("(accepted — 200, SSE body not captured)".to_string(), None)
+    } else {
+        let b = crate::auth::bounded_text(resp, 8192).await;
+        let j = serde_json::from_str::<Value>(&b).ok();
+        (b, j)
+    };
+    Ok(RawCapture { method: "POST".into(), endpoint: url, status, body, body_json })
 }

@@ -1,19 +1,21 @@
-//! 엔드포인트 응답 raw 캡처 도구 — 이 크레이트가 때리는 각 요청의 **응답을 파싱 전
-//! 원본 그대로 JSON 으로** 뽑는다. OpenAI 가 응답 모양을 바꿔도 디버그 코드를 새로 짜지
-//! 않고, 이 도구 한 번 돌려 "지금 실제로 뭐가 오는지"를 보고 파서를 고치면 된다.
+//! Raw endpoint-response capture tool: dumps each request's response as
+//! unparsed JSON, so parser fixes can be based on what the API actually
+//! returns. Focuses on surfaces we don't control (server builtin tools,
+//! endpoint shapes). Requires the `capture` feature.
 //!
-//! `capture` feature 필요(라이브 API 캡처 도구라 기본 빌드에선 제외):
-//!   cargo run --example capture --features capture -- usage              > usage.json
-//!   cargo run --example capture --features capture -- responses "안녕"   > resp.json
-//!   cargo run --example capture --features capture -- responses --tool "서울 날씨? get_weather 써."
-//!   cargo run --example capture --features capture -- responses --web  "최신 뉴스 검색해서 알려줘."
-//!   cargo run --example capture --features capture -- device-code        > device.json
+//! Scenarios: usage, models, responses [--web|--image] <msg>, builtin-probe,
+//! device-code. No args or `all` runs every scenario. Results auto-saved to
+//! captures/<date>/<scenario>.json; progress/summary on stderr.
 //!
-//! stdout = 순수 JSON(저장/jq/버전 diff 용). 진행 메시지는 stderr.
+//! Run:
+//!   cargo run --example capture --features capture
+//!   cargo run --example capture --features capture -- usage
+//!   cargo run --example capture --features capture -- responses --image
+//!   cargo run --example capture --features capture -- builtin-probe
 //!
-//! 부작용 메모: usage(GET)·device-code(로그인 시작 POST만)는 안전, responses 는 토큰/쿼터
-//! 소모. refresh(`/oauth/token`)는 refresh_token 을 회전시켜 저장 인증을 깰 수 있어 이 도구에
-//! 일부러 넣지 않았다(STREAM_EVENTS_OBSERVED.md 참고).
+//! File format: { "meta": {scenario, captured_at_unix}, "capture": <body> }
+//! Note: responses/builtin-probe consume tokens; refresh is intentionally
+//! excluded since it rotates refresh_token and can break saved auth.
 
 use std::process::ExitCode;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -21,95 +23,151 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use chatgpt_oauth::{SendOptions, capture, device_code_login, load_codex_cli_tokens};
 use serde_json::{Value, json};
 
+/// Scenarios run by "all": (name, default prompt).
+const ALL_SCENARIOS: &[(&str, &str)] = &[
+    ("usage", ""),
+    ("models", ""),
+    ("responses-text", "Introduce yourself in one sentence."),
+    ("responses-web", "Web-search and give me one line of today's top news."),
+    ("responses-image", "Draw a small cat icon."),
+    ("builtin-probe", ""),
+    ("device-code", ""),
+];
+
 #[tokio::main]
 async fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    let scenario = args.first().cloned().unwrap_or_default();
+    let scenario = args.first().cloned().unwrap_or_else(|| "all".into());
+
+    let plan: Vec<(String, String)> = match scenario.as_str() {
+        "all" => ALL_SCENARIOS.iter().map(|(n, p)| (n.to_string(), p.to_string())).collect(),
+        "usage" | "models" | "builtin-probe" | "device-code" => {
+            vec![(scenario.clone(), String::new())]
+        }
+        "responses" => {
+            let rest = &args[1..];
+            let flag = rest.first().map(|s| s.as_str()).unwrap_or("");
+            let (name, skip, default_prompt) = match flag {
+                "--web" => ("responses-web", 1, "Web-search and give me one line of today's top news."),
+                "--image" => ("responses-image", 1, "Draw a small cat icon."),
+                _ => ("responses-text", 0, "Introduce yourself in one sentence."),
+            };
+            let prompt = rest[skip..].join(" ");
+            let prompt = if prompt.trim().is_empty() { default_prompt.to_string() } else { prompt };
+            vec![(name.to_string(), prompt)]
+        }
+        _ => {
+            eprintln!(
+                "usage: cargo run --example capture --features capture -- [all|usage|responses [--web|--image] [prompt]|builtin-probe|device-code]\n  No args means all (capture everything). Results auto-saved to captures/<date>/<scenario>.json."
+            );
+            return ExitCode::from(2);
+        }
+    };
+
+    // Everything except device-code requires login.
+    let needs_login = plan.iter().any(|(n, _)| n != "device-code");
+    if needs_login && let Err(e) = ensure_login().await {
+        return fail(e);
+    }
+
+    let dir = format!("captures/{}", capture::today_utc());
+    if let Err(e) = std::fs::create_dir_all(&dir) {
+        return fail(format!("failed to create {dir}: {e}"));
+    }
 
     let captured_at_unix = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
 
-    // 시나리오별 캡처 → (meta 보강용 mode, capture 본문 Value)
-    let (mode, payload): (&str, Result<Value, String>) = match scenario.as_str() {
-        "usage" => {
-            if let Err(e) = ensure_login().await {
-                return fail(e);
+    eprintln!("▶ capture start → {dir}/ ({} scenarios)\n", plan.len());
+    let mut ok = 0;
+    let mut fail_n = 0;
+    for (name, prompt) in &plan {
+        let result = run_one(name, prompt).await;
+        let (cap_val, status) = match result {
+            Ok(v) => (v, "OK".to_string()),
+            Err(e) => (json!({ "error": e }), "ERROR".to_string()),
+        };
+        let doc = json!({
+            "meta": { "scenario": name, "captured_at_unix": captured_at_unix },
+            "capture": cap_val,
+        });
+        let path = format!("{dir}/{name}.json");
+        match std::fs::write(&path, serde_json::to_string_pretty(&doc).unwrap_or_default()) {
+            Ok(()) => {
+                let bytes = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+                eprintln!("  {status:5}  {path}  ({bytes} bytes)");
+                if status == "OK" { ok += 1 } else { fail_n += 1 }
             }
-            ("usage", capture::usage_raw().await.map(to_val).map_err(|e| format!("{e:#}")))
-        }
-        "device-code" => {
-            // 로그인 불필요(로그인 시작 단계).
-            (
-                "device-code",
-                capture::device_usercode_raw().await.map(to_val).map_err(|e| format!("{e:#}")),
-            )
-        }
-        "responses" => {
-            if let Err(e) = ensure_login().await {
-                return fail(e);
+            Err(e) => {
+                eprintln!("  WRITE-FAIL  {path}: {e}");
+                fail_n += 1;
             }
-            let rest: Vec<String> = args[1..].to_vec();
-            let with_tool = rest.first().map(|a| a == "--tool").unwrap_or(false);
-            let with_web = rest.first().map(|a| a == "--web").unwrap_or(false);
-            let prompt = if with_tool || with_web { rest[1..].join(" ") } else { rest.join(" ") };
-            if prompt.trim().is_empty() {
-                return fail("responses 시나리오엔 프롬프트가 필요합니다.".into());
-            }
-            let mut opts = SendOptions::default();
-            let mode = if with_tool {
-                opts.tools = vec![json!({
-                    "type": "function", "name": "get_weather",
-                    "description": "주어진 도시의 현재 날씨를 반환한다.",
-                    "parameters": {"type":"object","properties":{"city":{"type":"string"}},"required":["city"]}
-                })];
-                opts.tool_choice = Some(json!("auto"));
-                "responses-tool"
-            } else if with_web {
-                opts.tools = vec![json!({ "type": "web_search" })];
-                "responses-web"
-            } else {
-                "responses-text"
-            };
-            let payload = capture::responses_raw(&prompt, &opts)
-                .await
-                .map(|events| json!({ "prompt": prompt, "event_count": events.len(), "events": events }))
-                .map_err(|e| format!("{e:#}"));
-            (mode, payload)
         }
-        _ => {
-            eprintln!(
-                "usage: cargo run --example capture --features capture -- <usage|responses|device-code> [...]"
-            );
-            return ExitCode::from(2);
-        }
-    };
-
-    let capture_val = match payload {
-        Ok(v) => v,
-        Err(e) => return fail(e),
-    };
-
-    let doc = json!({
-        "meta": { "scenario": mode, "captured_at_unix": captured_at_unix },
-        "capture": capture_val,
-    });
-    println!("{}", serde_json::to_string_pretty(&doc).unwrap_or_default());
-    eprintln!("\n캡처 완료 (scenario={mode}). stdout 은 순수 JSON — 저장: `... > capture.json`");
-    ExitCode::SUCCESS
+    }
+    eprintln!("\ndone: {ok} OK, {fail_n} failed → {dir}/");
+    if fail_n > 0 { ExitCode::FAILURE } else { ExitCode::SUCCESS }
 }
 
-/// RawCapture(Serialize) → Value.
-fn to_val(c: capture::RawCapture) -> Value {
-    serde_json::to_value(c).unwrap_or(Value::Null)
+/// Dispatch a scenario name to its capture call.
+async fn run_one(name: &str, prompt: &str) -> Result<Value, String> {
+    let to_val = |c: capture::RawCapture| serde_json::to_value(c).unwrap_or(Value::Null);
+    match name {
+        "usage" => capture::usage_raw().await.map(to_val).map_err(|e| format!("{e:#}")),
+        "models" => capture::models_raw().await.map(to_val).map_err(|e| format!("{e:#}")),
+        "device-code" => capture::device_usercode_raw().await.map(to_val).map_err(|e| format!("{e:#}")),
+        "builtin-probe" => builtin_probe().await,
+        "responses-text" | "responses-web" | "responses-image" => {
+            let tools = match name {
+                "responses-web" => vec![json!({ "type": "web_search" })],
+                "responses-image" => vec![json!({ "type": "image_generation" })],
+                _ => Vec::new(),
+            };
+            // SendOptions is #[non_exhaustive]: build via default() + field mutation.
+            let mut opts = SendOptions::default();
+            opts.tools = tools;
+            capture::responses_raw(prompt, &opts)
+                .await
+                .map(|events| json!({ "prompt": prompt, "event_count": events.len(), "events": events }))
+                .map_err(|e| format!("{e:#}"))
+        }
+        other => Err(format!("unknown scenario: {other}")),
+    }
+}
+
+/// Probe builtin-tool candidates: send each type and record 200 (accepted)
+/// vs 4xx (unsupported) to discover what this backend actually accepts.
+async fn builtin_probe() -> Result<Value, String> {
+    let candidates = [
+        "web_search",
+        "image_generation",
+        "file_search",
+        "code_interpreter",
+        "computer_use",
+        "local_shell",
+    ];
+    let mut results = Vec::new();
+    for t in candidates {
+        let entry = match capture::responses_probe_raw(vec![json!({ "type": t })], "hi").await {
+            Ok(rc) => json!({
+                "tool": t,
+                "status": rc.status,
+                "accepted": rc.status == 200,
+                "body": rc.body,        // placeholder on 200, error body otherwise
+            }),
+            Err(e) => json!({ "tool": t, "error": format!("{e:#}") }),
+        };
+        results.push(entry);
+    }
+    Ok(json!({ "probed": results }))
 }
 
 async fn ensure_login() -> Result<(), String> {
     match load_codex_cli_tokens() {
         Ok(Some(_)) => Ok(()),
         Ok(None) => {
-            eprintln!("저장된 토큰 없음 — device 로그인 시작...");
+            eprintln!("no saved token — starting device login...");
             device_code_login().await.map(|_| ()).map_err(|e| format!("login failed: {e:#}"))
         }
         Err(e) => Err(format!("failed to read token: {e:#}")),

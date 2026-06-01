@@ -1,12 +1,18 @@
 [package]
-name = "chatgpt-oauth"
+name = "chatgpt-oauth-rs"
 version = "0.1.0"
 edition = "2024"
 description = "Pure low-level client for the ChatGPT backend (chatgpt.com/backend-api/codex/responses) using ChatGPT subscription OAuth tokens instead of a paid API key. SDK-style only — no chat session, no history, no REPL."
 
+# Package is `chatgpt-oauth-rs`, but the import path stays `chatgpt_oauth`
+# (the `-rs` suffix is just a repo/crates.io disambiguator).
+[lib]
+name = "chatgpt_oauth"
+
 [features]
-# 진단용 raw-응답 캡처 모듈(`chatgpt_oauth::capture`). 기본 OFF → 공개 API 안 더럽힘.
-# 켜면 각 엔드포인트 응답을 "파싱 전 원본"으로 떠서 백엔드 변경을 눈으로 확인할 수 있다.
+# Diagnostic raw-response capture module (`chatgpt_oauth::capture`). Off by
+# default so it doesn't pollute the public API. When on, dumps each endpoint's
+# pre-parse response so backend changes can be inspected by eye.
 capture = []
 
 [dependencies]
@@ -20,20 +26,20 @@ reqwest = { version = "0.13.4", default-features = false, features = ["form", "j
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.150"
 thiserror = "2.0.18"
-# base_url 호스트 검증용 — 직접 문자열 split 대신 표준 URL 파서를 쓴다.
-# (수동 파싱은 `https://evil.com#@chatgpt.com` 류 우회에 취약했음.)
+# Used for base_url host validation: a real URL parser instead of string
+# splitting (manual parsing was vulnerable to `https://evil.com#@chatgpt.com`).
 url = "2.5"
-# default-features off → `#[instrument]`용 tracing-attributes 의존성 제거.
-# 우리는 warn!/debug! 매크로만 사용. (의존성·빌드 최소화)
+# default-features off drops the tracing-attributes dep used by `#[instrument]`;
+# we only use the warn!/debug! macros (minimize deps and build).
 tracing = { version = "0.1.41", default-features = false, features = ["std"] }
 tokio = { version = "1.52.3", features = ["rt-multi-thread", "macros", "io-util", "fs", "time", "sync"] }
 
 [dev-dependencies]
-# 테스트 전용 mock HTTP 서버. 배포 바이너리엔 포함되지 않음.
+# Test-only mock HTTP server. Not included in release binaries.
 wiremock = "0.6"
 
-# capture 예제는 `capture` feature 가 있어야만 빌드된다(라이브 API 캡처 도구).
-# `cargo build` (기본) 에선 스킵 → CI/일반 빌드 영향 없음.
+# The capture example (a live-API capture tool) builds only with the `capture`
+# feature, so a plain `cargo build` skips it (no CI / normal-build impact).
 [[example]]
 name = "capture"
 required-features = ["capture"]
