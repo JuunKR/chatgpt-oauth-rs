@@ -1,21 +1,17 @@
-//! 요청 **입력**을 타입으로 구성하는 빌더 — `tools` 선언과 `input` 배열을 생 `json!` 대신.
-//!
-//! 출력(StreamEvent/Response)과 대칭. 와이어가 JSON 이라 빌더는 `Value` 를 돌려주고,
-//! `SendOptions.tools`(`Vec<Value>`) / `open_stream_with_input(input: Value)` 에 그대로 들어간다.
-//! (raw `json!` 도 여전히 escape 로 가능.)
+//! Typed builders for request input — `tools` declarations and the `input`
+//! array, instead of raw `json!`. Each returns a `Value` for the wire.
 
 use serde_json::{Value, json};
 
-/// `SendOptions.tools` 에 넣을 툴 선언 빌더. 전부 `Value` 를 반환한다.
+/// Builder for `SendOptions.tools` declarations.
 pub struct Tool;
 
 impl Tool {
-    /// 커스텀 function 툴. `parameters` 는 JSON Schema(Value).
+    /// Custom function tool; `parameters` is a JSON Schema.
     pub fn function(name: impl Into<String>, parameters: Value) -> Value {
         json!({ "type": "function", "name": name.into(), "parameters": parameters })
     }
 
-    /// 설명을 단 커스텀 function 툴.
     pub fn function_described(
         name: impl Into<String>,
         description: impl Into<String>,
@@ -29,28 +25,34 @@ impl Tool {
         })
     }
 
-    /// 서버 빌트인 web_search (이 백엔드 수용 확인됨).
+    /// Server built-in web_search (accepted by this backend).
     pub fn web_search() -> Value {
         json!({ "type": "web_search" })
     }
 
-    /// 서버 빌트인 image_generation (이 백엔드 수용 확인됨).
+    /// Server built-in image_generation (accepted by this backend).
     pub fn image_generation() -> Value {
         json!({ "type": "image_generation" })
     }
 }
 
-/// `input` 배열에 넣을 항목 빌더 — 멀티턴/툴 결과 되먹임. 전부 `Value` 반환.
+/// Builder for `input` array items (multiturn / tool result feedback).
 pub struct InputItem;
 
 impl InputItem {
-    /// 사용자 메시지.
+    /// User message; content type is `input_text`.
     pub fn user(text: impl Into<String>) -> Value {
         json!({ "role": "user", "content": [{ "type": "input_text", "text": text.into() }] })
     }
 
-    /// 커스텀 툴 실행 **결과** 되먹임. `call_id` 는 모델 function_call 의 것과 매칭.
-    /// (function_call 에코는 `ToolCall::to_input_item()` 참고 — store:false 라 둘 다 넣는다.)
+    /// Prior assistant turn for history replay. This backend is `store:false`, so
+    /// past responses must be fed back in. Note content type is `output_text`
+    /// (not `input_text` like user) — the builder fixes this easy-to-miss asymmetry.
+    pub fn assistant(text: impl Into<String>) -> Value {
+        json!({ "role": "assistant", "content": [{ "type": "output_text", "text": text.into() }] })
+    }
+
+    /// Custom tool result feedback; `call_id` matches the model's function_call.
     pub fn function_output(call_id: impl Into<String>, output: impl Into<String>) -> Value {
         json!({ "type": "function_call_output", "call_id": call_id.into(), "output": output.into() })
     }
@@ -73,9 +75,15 @@ mod tests {
 
     #[test]
     fn input_item_shape() {
-        let u = InputItem::user("안녕");
+        let u = InputItem::user("hi");
         assert_eq!(u["role"], "user");
-        assert_eq!(u["content"][0]["text"], "안녕");
+        assert_eq!(u["content"][0]["type"], "input_text");
+        assert_eq!(u["content"][0]["text"], "hi");
+        // assistant uses output_text, unlike user.
+        let a = InputItem::assistant("hello");
+        assert_eq!(a["role"], "assistant");
+        assert_eq!(a["content"][0]["type"], "output_text");
+        assert_eq!(a["content"][0]["text"], "hello");
         let o = InputItem::function_output("c1", "{\"temp\":21}");
         assert_eq!(o["type"], "function_call_output");
         assert_eq!(o["call_id"], "c1");
