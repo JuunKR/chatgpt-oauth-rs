@@ -1,4 +1,4 @@
-# chatgpt-oauth
+# chatgpt-oauth-rs
 
 A **low-level Rust client** that calls the ChatGPT backend
 (`chatgpt.com/backend-api/codex/responses`) directly using a ChatGPT
@@ -23,7 +23,7 @@ Not published to crates.io yet (0.1.0). Use a git dependency:
 
 ```toml
 [dependencies]
-chatgpt-oauth = { git = "https://github.com/<your>/chatgpt-oauth" }
+chatgpt-oauth-rs = { git = "https://github.com/JuunKR/chatgpt-oauth-rs" }   # imported as `chatgpt_oauth`
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 anyhow = "1"           # for the Result<()> + ? error propagation in the examples
 futures-util = "0.3"   # for the streaming API (.next())

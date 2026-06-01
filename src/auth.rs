@@ -454,10 +454,21 @@ impl std::fmt::Debug for TokenResp {
 
 /// Sign-in prompt shown during `device_code_login`. Non-CLI consumers can
 /// receive this via [`device_code_login_with`] and render it in their own UI.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct DeviceCodePrompt<'a> {
     pub verification_url: &'a str,
     pub user_code: &'a str,
+}
+
+// Redacted Debug: hand-rolled so `user_code` doesn't leak into logs via `{:?}`.
+// (Intentional display goes through the `user_code` field directly, not Debug.)
+impl std::fmt::Debug for DeviceCodePrompt<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DeviceCodePrompt")
+            .field("verification_url", &self.verification_url)
+            .field("user_code", &"[redacted]")
+            .finish()
+    }
 }
 
 /// Run device-code login, printing the URL/code to stdout (CLI default). To
@@ -1197,6 +1208,19 @@ mod tests {
         assert!(!dumped.contains("SUPER_SECRET_REFRESH"), "refresh token leaked: {dumped}");
         assert!(dumped.contains("[redacted]"));
         assert!(dumped.contains(DEFAULT_BASE_URL));
+    }
+
+    #[test]
+    fn device_code_prompt_debug_redacts_user_code() {
+        let p = DeviceCodePrompt {
+            verification_url: "https://auth.openai.com/codex/device",
+            user_code: "SECRET-USER-CODE",
+        };
+        let dumped = format!("{p:?}");
+        assert!(!dumped.contains("SECRET-USER-CODE"), "user_code leaked: {dumped}");
+        assert!(dumped.contains("[redacted]"));
+        // The (non-secret) verification URL stays visible for debugging.
+        assert!(dumped.contains("auth.openai.com/codex/device"));
     }
 
     #[test]

@@ -1,8 +1,13 @@
 [package]
-name = "chatgpt-oauth"
+name = "chatgpt-oauth-rs"
 version = "0.1.0"
 edition = "2024"
 description = "Pure low-level client for the ChatGPT backend (chatgpt.com/backend-api/codex/responses) using ChatGPT subscription OAuth tokens instead of a paid API key. SDK-style only — no chat session, no history, no REPL."
+
+# Package is `chatgpt-oauth-rs`, but the import path stays `chatgpt_oauth`
+# (the `-rs` suffix is just a repo/crates.io disambiguator).
+[lib]
+name = "chatgpt_oauth"
 
 [features]
 # Diagnostic raw-response capture module (`chatgpt_oauth::capture`). Off by
