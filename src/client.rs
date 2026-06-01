@@ -2,7 +2,8 @@
 //!
 //! Async (tokio + reqwest). The ChatGPT backend rejects `stream: false`, so
 //! all calls are SSE. `send_message` is a convenience wrapper that drives the
-//! stream to completion and returns the final response Value.
+//! stream to completion and returns a typed [`Response`](crate::Response)
+//! (raw `Value` still available via `Response::raw()`).
 
 use std::future::Future;
 use std::sync::OnceLock;
@@ -153,7 +154,7 @@ pub(crate) fn build_headers(creds: &CodexCredentials, stream: bool) -> Result<He
     Ok(headers)
 }
 
-fn normalize_input(user_message: &str) -> Value {
+pub(crate) fn normalize_input(user_message: &str) -> Value {
     json!([
         {
             "role": "user",
@@ -192,14 +193,51 @@ async fn http_error(resp: reqwest::Response) -> ClientError {
     }
 }
 
-/// `GET /models` — list the model slugs the current account can call.
+/// `/models` 항목 하나. 응답은 모델당 ~38개 필드라 **고가치만 접근자 + 나머지 `raw()`**
+/// (전체 스키마 미러링은 드리프트라 안 함 — 우리 타입 레이어 공통 원칙).
+#[derive(Debug, Clone)]
+pub struct Model {
+    raw: Value,
+}
+
+impl Model {
+    pub(crate) fn new(raw: Value) -> Model {
+        Model { raw }
+    }
+    /// 요청에 넣는 모델 식별자 (`SendOptions.model`).
+    pub fn slug(&self) -> Option<&str> {
+        self.raw.get("slug").and_then(|v| v.as_str())
+    }
+    pub fn display_name(&self) -> Option<&str> {
+        self.raw.get("display_name").and_then(|v| v.as_str())
+    }
+    pub fn description(&self) -> Option<&str> {
+        self.raw.get("description").and_then(|v| v.as_str())
+    }
+    pub fn context_window(&self) -> Option<u64> {
+        self.raw.get("context_window").and_then(|v| v.as_u64())
+    }
+    pub fn max_context_window(&self) -> Option<u64> {
+        self.raw.get("max_context_window").and_then(|v| v.as_u64())
+    }
+    pub fn visibility(&self) -> Option<&str> {
+        self.raw.get("visibility").and_then(|v| v.as_str())
+    }
+    /// 나머지 필드(supported_reasoning_levels, available_in_plans 등) escape.
+    pub fn raw(&self) -> &Value {
+        &self.raw
+    }
+}
+
+/// `GET /models` — 현재 계정이 쓸 수 있는 모델 목록(타입 [`Model`]).
 /// 재시도 가능한 오류(429/5xx/네트워크)는 백오프하며 최대 DEFAULT_MAX_RETRIES 번 더 시도.
-pub async fn list_models() -> Result<Vec<Value>, ClientError> {
-    with_retry(DEFAULT_MAX_RETRIES, true, || async {
+pub async fn list_models() -> Result<Vec<Model>, ClientError> {
+    let raw = with_retry(DEFAULT_MAX_RETRIES, true, || async {
         let creds = resolve_credentials(false).await?;
         list_models_once(&creds, true).await
     })
-    .await
+    .await?;
+    Ok(raw.into_iter().map(Model::new).collect())
 }
 
 /// 내부 구현: 이미 해석된 creds 로 1회 호출. `refresh_on_401` 이 true 면 401 시
@@ -534,7 +572,7 @@ async fn open_stream_with_input_once(
     Ok(sse_event_stream(resp.bytes_stream(), opts.idle_timeout))
 }
 
-fn build_request_body(input: Value, opts: &SendOptions) -> Value {
+pub(crate) fn build_request_body(input: Value, opts: &SendOptions) -> Value {
     let mut body_map = serde_json::Map::new();
     body_map.insert("model".into(), json!(opts.model));
     body_map.insert("instructions".into(), json!(opts.instructions));
@@ -788,11 +826,11 @@ fn take_event(data_lines: &mut Vec<String>) -> Option<Result<Option<Value>, Clie
     }
 }
 
-/// Send a single user message and return the final response dict, combining
-/// deltas internally.
-pub async fn send_message(user_message: &str, opts: &SendOptions) -> Result<Value, ClientError> {
+/// Send a single user message and return the typed [`Response`](crate::Response),
+/// combining deltas internally. (원본 Value 는 `Response::raw()` / `into_raw()`.)
+pub async fn send_message(user_message: &str, opts: &SendOptions) -> Result<crate::Response, ClientError> {
     let stream = open_stream(user_message, opts).await?;
-    drive_stream_to_response(stream).await
+    Ok(crate::Response::new(drive_stream_to_response(stream).await?))
 }
 
 /// 테스트 전용 주입 seam: 주어진 creds 를 그대로 사용(401 자동 갱신 없음).
@@ -1083,6 +1121,22 @@ mod tests {
     #[test]
     fn extract_text_empty_when_no_output() {
         assert_eq!(extract_text(&json!({})), "");
+    }
+
+    #[test]
+    fn model_typed_accessors() {
+        let m = Model::new(json!({
+            "slug":"gpt-5.3-codex","display_name":"GPT-5.3 Codex",
+            "context_window":272000,"max_context_window":400000,"visibility":"public","extra":1
+        }));
+        assert_eq!(m.slug(), Some("gpt-5.3-codex"));
+        assert_eq!(m.display_name(), Some("GPT-5.3 Codex"));
+        assert_eq!(m.context_window(), Some(272000));
+        assert_eq!(m.max_context_window(), Some(400000));
+        assert_eq!(m.visibility(), Some("public"));
+        assert_eq!(m.raw()["extra"], 1); // 타입 안 한 필드는 raw() 로
+        // 없는 필드는 None.
+        assert_eq!(Model::new(json!({})).slug(), None);
     }
 
     // ── SSE 파서 ──

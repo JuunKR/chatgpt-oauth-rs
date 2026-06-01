@@ -45,6 +45,21 @@ pub enum AuthError {
     Other(String), // 그 외 에러
 }
 
+/// auth 계열 함수는 `anyhow::Error` 를 반환한다(내부에 `AuthError` 가 들어있을 수 있음).
+/// 이 헬퍼로 **재로그인 필요**(토큰 만료/없음/거부)를 한 줄로 분기한다 — 멀티 에이전트가
+/// `device_code_login()` 재실행을 트리거할 때 쓴다. (`anyhow!(AuthError)` = `Error::from`
+/// 이라 타입이 보존돼 downcast 가능.)
+///
+/// ```ignore
+/// match resolve_credentials(false).await {
+///     Err(e) if is_relogin_required(&e) => { device_code_login().await?; /* retry */ }
+///     other => other?,
+/// }
+/// ```
+pub fn is_relogin_required(err: &anyhow::Error) -> bool {
+    matches!(err.downcast_ref::<AuthError>(), Some(AuthError::ReloginRequired(_)))
+}
+
 // Clone=복제 가능, Serialize/Deserialize=JSON 변환 가능.
 // Debug 는 직접 구현(아래) — 토큰/API 키가 로그·패닉 출력에 노출되지 않도록 가린다.
 #[derive(Clone, Serialize, Deserialize)]
@@ -1053,7 +1068,7 @@ fn now_iso() -> String {
 /// Clamped to `[0, 9999-12-31T23:59:59Z]`. Used only for metadata, so we
 /// prioritize panic / overflow safety over absolute precision.
 // 1970 기준 경과 초 → (연,월,일,시,분,초) 튜플. 외부 날짜 라이브러리 없이 직접 계산.
-fn epoch_to_ymdhms(epoch: i64) -> (i32, u32, u32, u32, u32, u32) {
+pub(crate) fn epoch_to_ymdhms(epoch: i64) -> (i32, u32, u32, u32, u32, u32) {
     const MAX_EPOCH: i64 = 253_402_300_799; // 9999-12-31T23:59:59Z (`_`=자릿수 구분, 무시됨)
     let epoch = epoch.clamp(0, MAX_EPOCH); // 0~최대 사이로 가둠 (오버플로 방지)
     // div_euclid=나눗셈 몫, rem_euclid=나머지 (음수에도 안전). 86400=하루 초.

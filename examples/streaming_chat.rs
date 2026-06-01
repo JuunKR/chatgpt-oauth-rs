@@ -13,7 +13,9 @@
 use std::io::Write;
 use std::process::ExitCode;
 
-use chatgpt_oauth::{SendOptions, device_code_login, load_codex_cli_tokens, open_stream};
+use chatgpt_oauth::{
+    SendOptions, StreamEvent, device_code_login, load_codex_cli_tokens, open_event_stream,
+};
 use futures_util::StreamExt; // 스트림에서 .next() 를 쓰기 위한 trait
 
 #[tokio::main]
@@ -43,19 +45,19 @@ async fn main() -> ExitCode {
 
     // 3) 스트림을 연다. open_stream 도 내부에서 creds 해석 + 401 갱신을 처리한다.
     let opts = SendOptions::default();
-    let stream = match open_stream(&prompt, &opts).await {
+    // 타입 스트림(open_event_stream) — 매직 문자열 없이 StreamEvent 로 match.
+    let stream = match open_event_stream(&prompt, &opts).await {
         Ok(s) => s,
         Err(e) => {
             eprintln!("failed to open stream: {e}");
             return ExitCode::FAILURE;
         }
     };
-    // open_stream 이 돌려주는 스트림은 Unpin 이 아니라(내부 async unfold), .next() 전에
-    // 고정(pin)해야 한다. Box::pin 으로 힙에 고정하면 Unpin 이 돼 그대로 순회 가능.
+    // 스트림은 Unpin 이 아니라(내부 async unfold), .next() 전에 Box::pin 으로 고정한다.
     let mut stream = Box::pin(stream);
 
-    // 4) SSE 이벤트를 오는 대로 처리. 텍스트 delta 는 즉시 출력(flush)하고,
-    //    터미널 실패/미완 이벤트는 에러로 surface 한다. [DONE] 에서 스트림이 끝난다.
+    // 4) 이벤트를 오는 대로 처리. 텍스트 delta 는 즉시 출력(flush)하고, 터미널 실패/미완은
+    //    에러로 surface. 그 외(created/툴 진행 등)는 무시.
     let mut printed_any = false;
     while let Some(ev) = stream.next().await {
         let ev = match ev {
@@ -65,23 +67,21 @@ async fn main() -> ExitCode {
                 return ExitCode::FAILURE;
             }
         };
-        match ev.get("type").and_then(|t| t.as_str()).unwrap_or("") {
-            "response.output_text.delta" => {
-                if let Some(delta) = ev.get("delta").and_then(|d| d.as_str()) {
-                    print!("{delta}");
-                    let _ = std::io::stdout().flush(); // 줄바꿈 전이라도 즉시 화면에
-                    printed_any = true;
-                }
+        match ev {
+            StreamEvent::TextDelta(delta) => {
+                print!("{delta}");
+                let _ = std::io::stdout().flush(); // 줄바꿈 전이라도 즉시 화면에
+                printed_any = true;
             }
-            "response.failed" => {
-                eprintln!("\nresponse failed: {ev}");
+            StreamEvent::Failed(err) => {
+                eprintln!("\nresponse failed: {err}");
                 return ExitCode::FAILURE;
             }
-            "response.incomplete" => {
-                eprintln!("\nresponse incomplete: {ev}");
+            StreamEvent::Incomplete(detail) => {
+                eprintln!("\nresponse incomplete: {detail}");
                 return ExitCode::FAILURE;
             }
-            _ => {} // 그 외 이벤트(created/output_item.done 등)는 이 예제에선 무시
+            _ => {}
         }
     }
 

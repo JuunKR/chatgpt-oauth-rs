@@ -26,6 +26,16 @@ pub struct RawCapture {
     pub body_json: Option<Value>,
 }
 
+/// 오늘 날짜(UTC) "YYYY-MM-DD". 캡처 파일/디렉터리 이름에 쓴다(크레이트의 날짜 로직 재사용).
+pub fn today_utc() -> String {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let (y, m, d, _, _, _) = crate::auth::epoch_to_ymdhms(secs);
+    format!("{y:04}-{m:02}-{d:02}")
+}
+
 async fn snapshot(method: &str, url: &str, resp: reqwest::Response) -> Result<RawCapture> {
     let status = resp.status().as_u16();
     let body = resp.text().await.context("failed to read response body")?;
@@ -43,6 +53,9 @@ async fn snapshot(method: &str, url: &str, resp: reqwest::Response) -> Result<Ra
 /// 멱등(GET)이라 반복 캡처해도 안전. 토큰 필요(없으면 ReloginRequired).
 pub async fn usage_raw() -> Result<RawCapture> {
     let creds = resolve_credentials(false).await?;
+    // 정상 client 경로와 동일하게, Authorization 붙이기 전에 토큰 목적지 검증.
+    // (안 하면 CODEX_ALLOW_INSECURE_BASE_URL + 악성 base_url 로 디스크 토큰 유출 가능.)
+    auth::validate_token_destination(&creds)?;
     let url = client::usage_url_from_base(&creds.base_url);
     let resp = client::shared_client()
         .get(&url)
@@ -51,6 +64,23 @@ pub async fn usage_raw() -> Result<RawCapture> {
         .send()
         .await
         .context("usage request failed")?;
+    snapshot("GET", &url, resp).await
+}
+
+/// `GET /models` — 모델 목록 응답을 **파싱 없이** 원본으로(멱등, 안전).
+pub async fn models_raw() -> Result<RawCapture> {
+    let creds = resolve_credentials(false).await?;
+    // 정상 client 경로와 동일하게, Authorization 붙이기 전에 토큰 목적지 검증.
+    // (안 하면 CODEX_ALLOW_INSECURE_BASE_URL + 악성 base_url 로 디스크 토큰 유출 가능.)
+    auth::validate_token_destination(&creds)?;
+    let url = format!("{}/models?client_version=1.0.0", creds.base_url);
+    let resp = client::shared_client()
+        .get(&url)
+        .timeout(Duration::from_secs(15))
+        .headers(client::build_headers(&creds, false)?)
+        .send()
+        .await
+        .context("models request failed")?;
     snapshot("GET", &url, resp).await
 }
 
@@ -75,8 +105,17 @@ pub async fn device_usercode_raw() -> Result<RawCapture> {
 /// `POST /responses` — SSE 이벤트를 **집계 없이 원본 Value 배열**로 수집.
 /// (open_stream 이 이미 원본 이벤트를 주므로 그걸 모은다. 토큰/쿼터 소모하지만 안전.)
 pub async fn responses_raw(prompt: &str, opts: &crate::SendOptions) -> Result<Vec<Value>> {
+    responses_with_input_raw(crate::client::normalize_input(prompt), opts).await
+}
+
+/// `POST /responses` 를 **완성된 input 배열**로 호출해 원본 이벤트를 수집(멀티턴/툴 결과
+/// 되먹임 캡처용). 단발 텍스트는 `responses_raw` 가 편의 래퍼.
+pub async fn responses_with_input_raw(
+    input: Value,
+    opts: &crate::SendOptions,
+) -> Result<Vec<Value>> {
     use futures_util::StreamExt;
-    let stream = client::open_stream(prompt, opts)
+    let stream = client::open_stream_with_input(input, opts)
         .await
         .context("failed to open /responses stream")?;
     let mut stream = Box::pin(stream);
@@ -85,4 +124,35 @@ pub async fn responses_raw(prompt: &str, opts: &crate::SendOptions) -> Result<Ve
         events.push(ev.context("stream event error")?);
     }
     Ok(events)
+}
+
+/// 빌트인 툴 **수용 여부 프로브**: 주어진 tools 로 `/responses` 에 최소 요청을 보내
+/// 200(수용)인지 4xx(미지원/설정필요)인지 + 에러 바디를 캡처한다. 스트림을 끝까지 읽지
+/// 않는다 — 200 이면 본문은 SSE(이미지 등 클 수 있음)라 "수용됨"만 기록하고, 비-200 이면
+/// 에러 바디를 8KB 까지 보존한다. "이 백엔드가 어떤 빌트인 툴을 받는지" 카탈로그 발견용.
+pub async fn responses_probe_raw(tools: Vec<Value>, prompt: &str) -> Result<RawCapture> {
+    let creds = resolve_credentials(false).await?;
+    // 정상 client 경로와 동일하게, Authorization 붙이기 전에 토큰 목적지 검증.
+    // (안 하면 CODEX_ALLOW_INSECURE_BASE_URL + 악성 base_url 로 디스크 토큰 유출 가능.)
+    auth::validate_token_destination(&creds)?;
+    let opts = crate::SendOptions { tools, ..Default::default() };
+    let body = client::build_request_body(client::normalize_input(prompt), &opts);
+    let url = format!("{}/responses", creds.base_url);
+    let resp = client::shared_client()
+        .post(&url)
+        .timeout(Duration::from_secs(30))
+        .headers(client::build_headers(&creds, true)?)
+        .json(&body)
+        .send()
+        .await
+        .context("responses probe request failed")?;
+    let status = resp.status().as_u16();
+    let (body, body_json) = if status == 200 {
+        ("(accepted — 200, SSE body not captured)".to_string(), None)
+    } else {
+        let b = crate::auth::bounded_text(resp, 8192).await;
+        let j = serde_json::from_str::<Value>(&b).ok();
+        (b, j)
+    };
+    Ok(RawCapture { method: "POST".into(), endpoint: url, status, body, body_json })
 }

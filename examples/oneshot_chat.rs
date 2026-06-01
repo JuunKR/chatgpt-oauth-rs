@@ -14,9 +14,7 @@
 
 use std::process::ExitCode;
 
-use chatgpt_oauth::{
-    SendOptions, device_code_login, extract_text, load_codex_cli_tokens, send_message,
-};
+use chatgpt_oauth::{SendOptions, device_code_login, load_codex_cli_tokens, send_message};
 
 #[tokio::main]
 async fn main() -> ExitCode {
@@ -49,7 +47,7 @@ async fn main() -> ExitCode {
     let opts = SendOptions::default();
     match send_message(&prompt, &opts).await {
         Ok(response) => {
-            let text = extract_text(&response);
+            let text = response.text();
             if text.is_empty() {
                 eprintln!("(응답에 텍스트가 없습니다)");
                 ExitCode::FAILURE
